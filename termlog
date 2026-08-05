@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# =============================================================================
+# termlog.sh — Logging de terminals
+# =============================================================================
+# Logs organizados por dia em logs/YYYY-MM-DD/session_N.log
+#
+# Uso:
+#   termlog start [nome]   Inicia uma sessão de logging (opcionalmente com nome)
+#   termlog stop           Termina a sessão actual (ou faz Ctrl+D / exit)
+#   termlog status         Mostra se está activo na shell actual
+#   termlog list [data]    Lista sessões (default: hoje)
+#   termlog show <ficheiro> Mostra um log limpo (sem códigos ANSI)
+#   termlog rotate [dias]  Comprime logs com mais de N dias (default: 7)
+#   termlog disable        Desactiva logging automático para esta shell
+#   termlog enable         Reactiva
+#
+# =============================================================================
+
+set -u
+
+# -------- Configuração (podes mudar via variáveis de ambiente) ---------------
+TERMLOG_DIR="${TERMLOG_DIR:-$HOME/logs}"
+TERMLOG_ROTATE_DAYS="${TERMLOG_ROTATE_DAYS:-7}"
+
+# -------- Detecção de SO (script tem flags diferentes em Linux vs macOS) -----
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)  echo "linux"  ;;
+        Darwin*) echo "macos"  ;;
+        *)       echo "other"  ;;
+    esac
+}
+
+# -------- Determina próximo número de sessão para o dia actual ---------------
+next_session_id() {
+    local day_dir="$1"
+    local n=1
+    while [[ -e "$day_dir/session_${n}.log" || -e "$day_dir/session_${n}.log.gz" ]]; do
+        n=$((n + 1))
+    done
+    echo "$n"
+}
+
+# -------- Inicia uma sessão de logging ---------------------------------------
+cmd_start() {
+    # Evita logging recursivo (se já estamos dentro de uma sessão `script`)
+    if [[ -n "${TERMLOG_ACTIVE:-}" ]]; then
+        echo "[termlog] Já estás dentro de uma sessão de logging (PID $TERMLOG_ACTIVE)."
+        echo "[termlog] Faz 'exit' ou Ctrl+D para terminar antes de iniciar outra."
+        return 1
+    fi
+
+    local label="${1:-}"
+    local today
+    today="$(date +%Y-%m-%d)"
+    local day_dir="$TERMLOG_DIR/$today"
+    mkdir -p "$day_dir"
+
+    local sid
+    sid="$(next_session_id "$day_dir")"
+
+    # Nome do ficheiro: session_N.log ou session_N_label.log
+    local fname="session_${sid}"
+    if [[ -n "$label" ]]; then
+        # Sanitiza o label: só letras/números/_/-, colapsa _ múltiplos, remove _ extra
+        local safe_label
+        safe_label="$(echo "$label" | tr -c 'A-Za-z0-9_-' '_' | sed -E 's/_+/_/g; s/^_+|_+$//g')"
+        [[ -n "$safe_label" ]] && fname="${fname}_${safe_label}"
+    fi
+    local logfile="$day_dir/${fname}.log"
+    local timingfile="$day_dir/${fname}.timing"
+
+    # Cabeçalho com metadados (útil para correlacionar com notas)
+    {
+        echo "============================================================"
+        echo "TERMLOG SESSION"
+        echo "  Started:  $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "  Host:     $(hostname)"
+        echo "  User:     $(whoami)"
+        echo "  TTY:      $(tty 2>/dev/null || echo 'n/a')"
+        echo "  Shell:    $SHELL"
+        echo "  PID:      $$"
+        echo "  Label:    ${label:-<none>}"
+        echo "  Logfile:  $logfile"
+        echo "============================================================"
+    } > "$logfile"
+
+    echo "[termlog] A iniciar sessão #$sid → $logfile"
+    echo "[termlog] Faz 'exit' ou Ctrl+D para terminar e fechar o log."
+    echo
+
+    export TERMLOG_ACTIVE="$$"
+    export TERMLOG_FILE="$logfile"
+
+    local os
+    os="$(detect_os)"
+
+    # `script` tem syntax diferente entre Linux (util-linux) e macOS (BSD).
+    # -a: append (não sobrescreve o cabeçalho que acabámos de escrever)
+    # -q: quiet (não imprime "Script started/done")
+    # -f: flush a cada escrita (importante se o sistema crashar)
+    # No macOS BSD, -F força flush; no Linux util-linux usa-se -f.
+    # Em Linux ainda gravamos timing file para reprodução com `scriptreplay`.
+    if [[ "$os" == "linux" ]]; then
+        script -q -f -a --timing="$timingfile" "$logfile"
+    elif [[ "$os" == "macos" ]]; then
+        # macOS: -t produz timing file; sintaxe é diferente
+        script -q -a -t 0 "$logfile" "$SHELL"
+    else
+        script -q -a "$logfile"
+    fi
+
+    local rc=$?
+    unset TERMLOG_ACTIVE TERMLOG_FILE
+
+    {
+        echo
+        echo "============================================================"
+        echo "  Ended:    $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "  ExitCode: $rc"
+        echo "============================================================"
+    } >> "$logfile"
+
+    echo "[termlog] Sessão terminada. Log: $logfile"
+    return $rc
+}
+
+# -------- Status da sessão actual --------------------------------------------
+cmd_status() {
+    if [[ -n "${TERMLOG_ACTIVE:-}" ]]; then
+        echo "[termlog] ACTIVO"
+        echo "  PID:  $TERMLOG_ACTIVE"
+        echo "  File: ${TERMLOG_FILE:-?}"
+    else
+        echo "[termlog] Inactivo nesta shell."
+    fi
+}
+
+# -------- Stop (informativo — `script` termina com exit/Ctrl+D) --------------
+cmd_stop() {
+    if [[ -n "${TERMLOG_ACTIVE:-}" ]]; then
+        echo "[termlog] Para parar, faz 'exit' ou Ctrl+D — isso fecha a sub-shell do script."
+    else
+        echo "[termlog] Não há sessão activa nesta shell."
+    fi
+}
+
+# -------- Lista sessões de um dia --------------------------------------------
+cmd_list() {
+    local day="${1:-$(date +%Y-%m-%d)}"
+    local day_dir="$TERMLOG_DIR/$day"
+    if [[ ! -d "$day_dir" ]]; then
+        echo "[termlog] Sem logs para $day."
+        return 0
+    fi
+    echo "[termlog] Sessões em $day_dir:"
+    # Lista .log e .log.gz, ordenados, com tamanho legível
+    ls -lh "$day_dir"/*.log "$day_dir"/*.log.gz 2>/dev/null \
+        | awk '{printf "  %-10s %s %s %s  %s\n", $5, $6, $7, $8, $NF}'
+}
+
+# -------- Mostra um log "limpo" (remove códigos ANSI e backspaces) -----------
+cmd_show() {
+    local f="${1:-}"
+    if [[ -z "$f" ]]; then
+        echo "Uso: termlog show <ficheiro>" >&2
+        return 1
+    fi
+    # Se passaram só o nome relativo, procura nos logs
+    if [[ ! -f "$f" ]]; then
+        local found
+        found="$(find "$TERMLOG_DIR" -name "$f" -type f 2>/dev/null | head -1)"
+        [[ -n "$found" ]] && f="$found"
+    fi
+    if [[ ! -f "$f" ]]; then
+        echo "[termlog] Ficheiro não encontrado: $f" >&2
+        return 1
+    fi
+
+    # Descomprime se necessário, depois passa por sed para remover ANSI
+    local reader="cat"
+    [[ "$f" == *.gz ]] && reader="zcat"
+
+    # Remove sequências ANSI (cores, movimento de cursor) e \r isolados
+    $reader "$f" | sed -E '
+        s/\x1B\[[0-9;?]*[a-zA-Z]//g;
+        s/\x1B\][^\x07]*\x07//g;
+        s/\r$//;
+    '
+}
+
+# -------- Rotação: comprime logs com mais de N dias --------------------------
+cmd_rotate() {
+    local days="${1:-$TERMLOG_ROTATE_DAYS}"
+    if [[ ! -d "$TERMLOG_DIR" ]]; then
+        echo "[termlog] Nada para rodar — $TERMLOG_DIR não existe."
+        return 0
+    fi
+    echo "[termlog] A comprimir logs .log com mais de $days dias em $TERMLOG_DIR..."
+    # Find compatível com Linux e macOS (-mtime +N == modificado há mais de N dias)
+    local count=0
+    while IFS= read -r -d '' file; do
+        gzip -9 "$file" && count=$((count + 1))
+    done < <(find "$TERMLOG_DIR" -type f -name "*.log" -mtime +"$days" -print0 2>/dev/null)
+    echo "[termlog] Comprimidos $count ficheiros."
+}
+
+# -------- Enable/Disable na shell actual -------------------------------------
+cmd_disable() {
+    export TERMLOG_DISABLED=1
+    echo "[termlog] Desactivado para esta shell. Use 'termlog enable' para reactivar."
+}
+cmd_enable() {
+    unset TERMLOG_DISABLED
+    echo "[termlog] Reactivado."
+}
+
+# -------- Help ---------------------------------------------------------------
+cmd_help() {
+    # Imprime as linhas de comentário no topo do ficheiro (skip shebang),
+    # parando quando aparece a primeira linha que não é comentário.
+    awk '
+        NR == 1 && /^#!/ { next }       # skip shebang
+        /^#/ { sub(/^# ?/, ""); print; next }
+        /^$/ && in_header { print; next }
+        { exit }
+        { in_header = 1 }
+    ' "$0"
+}
+
+# -------- Dispatcher ---------------------------------------------------------
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+        start)   cmd_start   "$@" ;;
+        stop)    cmd_stop    "$@" ;;
+        status)  cmd_status  "$@" ;;
+        list)    cmd_list    "$@" ;;
+        show)    cmd_show    "$@" ;;
+        rotate)  cmd_rotate  "$@" ;;
+        disable) cmd_disable "$@" ;;
+        enable)  cmd_enable  "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)
+            echo "[termlog] Comando desconhecido: $cmd" >&2
+            cmd_help
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
