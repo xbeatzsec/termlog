@@ -1,253 +1,230 @@
 #!/usr/bin/env bash
-# =============================================================================
-# termlog.sh — Logging de terminals
-# =============================================================================
-# Logs organizados por dia em logs/YYYY-MM-DD/session_N.log
-#
-# Uso:
-#   termlog start [nome]   Inicia uma sessão de logging (opcionalmente com nome)
-#   termlog stop           Termina a sessão actual (ou faz Ctrl+D / exit)
-#   termlog status         Mostra se está activo na shell actual
-#   termlog list [data]    Lista sessões (default: hoje)
-#   termlog show <ficheiro> Mostra um log limpo (sem códigos ANSI)
-#   termlog rotate [dias]  Comprime logs com mais de N dias (default: 7)
-#   termlog disable        Desactiva logging automático para esta shell
-#   termlog enable         Reactiva
-#
-# =============================================================================
-
+# Terminal session recorder. Linux util-linux backend.
 set -u
+umask "$(printf '%03o' "$((8#$(umask) | 077))")"
+TERMLOG_DIR=${TERMLOG_DIR:-$HOME/termlog_logs}
+TERMLOG_STATE_DIR=${TERMLOG_STATE_DIR:-${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}}/termlog}
+TERMLOG_MODE=${TERMLOG_MODE:-ask}
+TERMLOG_ROTATE_DAYS=${TERMLOG_ROTATE_DAYS:-7}
+TERMLOG_BANNER_STYLE=${TERMLOG_BANNER_STYLE:-detailed}
+TERMLOG_COLOR=${TERMLOG_COLOR:-auto}
+TERMLOG_TAB_TITLE=${TERMLOG_TAB_TITLE:-off}
 
-# -------- Configuração (podes mudar via variáveis de ambiente) ---------------
-TERMLOG_DIR="${TERMLOG_DIR:-$HOME/logs}"
-TERMLOG_ROTATE_DAYS="${TERMLOG_ROTATE_DAYS:-7}"
-
-# -------- Detecção de SO (script tem flags diferentes em Linux vs macOS) -----
-detect_os() {
-    case "$(uname -s)" in
-        Linux*)  echo "linux"  ;;
-        Darwin*) echo "macos"  ;;
-        *)       echo "other"  ;;
-    esac
+fail() { printf '[termlog] %s\n' "$*" >&2; return 1; }
+# Only private directories owned by this user can contain paths opened by script.
+private_dir() {
+    local p=$1 mode owner
+    [[ ! -L $p ]] || { fail "Directory is a symbolic link: $p"; return 1; }
+    if [[ ! -e $p ]]; then mkdir -p -- "$p" || return 1; fi
+    [[ -d $p && ! -L $p ]] || { fail "Invalid directory: $p"; return 1; }
+    owner=$(stat -c %u -- "$p") || return 1
+    mode=$(stat -c %a -- "$p") || return 1
+    [[ $owner == "$(id -u)" && $mode =~ ^[0-7]{3,4}$ ]] || { fail "Unsafe directory: $p"; return 1; }
+    (( (8#$mode & 077) == 0 )) || { fail "Permissions on $p are too permissive (use 0700)."; return 1; }
 }
-
-# -------- Determina próximo número de sessão para o dia actual ---------------
-next_session_id() {
-    local day_dir="$1"
-    local n=1
-    while [[ -e "$day_dir/session_${n}.log" || -e "$day_dir/session_${n}.log.gz" ]]; do
-        n=$((n + 1))
+setup() {
+    command -v flock >/dev/null && command -v script >/dev/null || { fail 'flock and script (util-linux) are required.'; return 1; }
+    script --version 2>/dev/null | grep -q util-linux || { fail 'This backend requires script from util-linux.'; return 1; }
+    private_dir "$TERMLOG_DIR" && private_dir "$TERMLOG_STATE_DIR" && private_dir "$TERMLOG_STATE_DIR/sessions"
+}
+global_lock() { exec 8>"$TERMLOG_STATE_DIR/global.lock" && flock -x 8; }
+global_unlock() { flock -u 8; exec 8>&-; }
+# Caller holds global lock. Lock files are never removed, avoiding inode races.
+active_count() {
+    local f n=0
+    shopt -s nullglob
+    for f in "$TERMLOG_STATE_DIR"/sessions/*.lock; do
+        [[ -f $f && ! -L $f ]] || continue
+        if ! ( flock -n -x 7 ) 7>>"$f"; then n=$((n+1)); else rm -f -- "${f%.lock}.meta"; fi
     done
-    echo "$n"
+    shopt -u nullglob
+    printf '%s\n' "$n"
 }
-
-# -------- Inicia uma sessão de logging ---------------------------------------
-cmd_start() {
-    # Evita logging recursivo (se já estamos dentro de uma sessão `script`)
-    if [[ -n "${TERMLOG_ACTIVE:-}" ]]; then
-        echo "[termlog] Já estás dentro de uma sessão de logging (PID $TERMLOG_ACTIVE)."
-        echo "[termlog] Faz 'exit' ou Ctrl+D para terminar antes de iniciar outra."
-        return 1
-    fi
-
-    local label="${1:-}"
-    local today
-    today="$(date +%Y-%m-%d)"
-    local day_dir="$TERMLOG_DIR/$today"
-    mkdir -p "$day_dir"
-
-    local sid
-    sid="$(next_session_id "$day_dir")"
-
-    # Nome do ficheiro: session_N.log ou session_N_label.log
-    local fname="session_${sid}"
-    if [[ -n "$label" ]]; then
-        # Sanitiza o label: só letras/números/_/-, colapsa _ múltiplos, remove _ extra
-        local safe_label
-        safe_label="$(echo "$label" | tr -c 'A-Za-z0-9_-' '_' | sed -E 's/_+/_/g; s/^_+|_+$//g')"
-        [[ -n "$safe_label" ]] && fname="${fname}_${safe_label}"
-    fi
-    local logfile="$day_dir/${fname}.log"
-    local timingfile="$day_dir/${fname}.timing"
-
-    # Cabeçalho com metadados (útil para correlacionar com notas)
-    {
-        echo "============================================================"
-        echo "TERMLOG SESSION"
-        echo "  Started:  $(date '+%Y-%m-%d %H:%M:%S %Z')"
-        echo "  Host:     $(hostname)"
-        echo "  User:     $(whoami)"
-        echo "  TTY:      $(tty 2>/dev/null || echo 'n/a')"
-        echo "  Shell:    $SHELL"
-        echo "  PID:      $$"
-        echo "  Label:    ${label:-<none>}"
-        echo "  Logfile:  $logfile"
-        echo "============================================================"
-    } > "$logfile"
-
-    echo "[termlog] A iniciar sessão #$sid → $logfile"
-    echo "[termlog] Faz 'exit' ou Ctrl+D para terminar e fechar o log."
-    echo
-
-    export TERMLOG_ACTIVE="$$"
-    export TERMLOG_FILE="$logfile"
-
-    local os
-    os="$(detect_os)"
-
-    # `script` tem syntax diferente entre Linux (util-linux) e macOS (BSD).
-    # -a: append (não sobrescreve o cabeçalho que acabámos de escrever)
-    # -q: quiet (não imprime "Script started/done")
-    # -f: flush a cada escrita (importante se o sistema crashar)
-    # No macOS BSD, -F força flush; no Linux util-linux usa-se -f.
-    # Em Linux ainda gravamos timing file para reprodução com `scriptreplay`.
-    if [[ "$os" == "linux" ]]; then
-        script -q -f -a --timing="$timingfile" "$logfile"
-    elif [[ "$os" == "macos" ]]; then
-        # macOS: -t produz timing file; sintaxe é diferente
-        script -q -a -t 0 "$logfile" "$SHELL"
-    else
-        script -q -a "$logfile"
-    fi
-
-    local rc=$?
-    unset TERMLOG_ACTIVE TERMLOG_FILE
-
-    {
-        echo
-        echo "============================================================"
-        echo "  Ended:    $(date '+%Y-%m-%d %H:%M:%S %Z')"
-        echo "  ExitCode: $rc"
-        echo "============================================================"
-    } >> "$logfile"
-
-    echo "[termlog] Sessão terminada. Log: $logfile"
-    return $rc
+check_active() { setup || return 1; global_lock || return 1; local n; n=$(active_count); global_unlock; (( n > 0 )); }
+# Strip control bytes before printing values derived from the environment or paths.
+ui_safe() { LC_ALL=C tr -cd '\40-\176'; }
+ui_width() {
+    local rows cols
+    read -r rows cols < <(stty size 2>/dev/null) || :
+    [[ ${cols:-} =~ ^[0-9]+$ ]] && (( cols > 0 )) || cols=80
+    UI_WIDTH=$cols
 }
-
-# -------- Status da sessão actual --------------------------------------------
-cmd_status() {
-    if [[ -n "${TERMLOG_ACTIVE:-}" ]]; then
-        echo "[termlog] ACTIVO"
-        echo "  PID:  $TERMLOG_ACTIVE"
-        echo "  File: ${TERMLOG_FILE:-?}"
-    else
-        echo "[termlog] Inactivo nesta shell."
-    fi
+ui_line() {
+    local line=$1
+    # Wrap at the terminal width after stripping untrusted terminal controls.
+    while (( ${#line} > UI_WIDTH )); do
+        printf '%s\n' "${line:0:UI_WIDTH}"
+        line=${line:UI_WIDTH}
+    done
+    printf '%s\n' "$line"
 }
-
-# -------- Stop (informativo — `script` termina com exit/Ctrl+D) --------------
-cmd_stop() {
-    if [[ -n "${TERMLOG_ACTIVE:-}" ]]; then
-        echo "[termlog] Para parar, faz 'exit' ou Ctrl+D — isso fecha a sub-shell do script."
-    else
-        echo "[termlog] Não há sessão activa nesta shell."
-    fi
-}
-
-# -------- Lista sessões de um dia --------------------------------------------
-cmd_list() {
-    local day="${1:-$(date +%Y-%m-%d)}"
-    local day_dir="$TERMLOG_DIR/$day"
-    if [[ ! -d "$day_dir" ]]; then
-        echo "[termlog] Sem logs para $day."
-        return 0
-    fi
-    echo "[termlog] Sessões em $day_dir:"
-    # Lista .log e .log.gz, ordenados, com tamanho legível
-    ls -lh "$day_dir"/*.log "$day_dir"/*.log.gz 2>/dev/null \
-        | awk '{printf "  %-10s %s %s %s  %s\n", $5, $6, $7, $8, $NF}'
-}
-
-# -------- Mostra um log "limpo" (remove códigos ANSI e backspaces) -----------
-cmd_show() {
-    local f="${1:-}"
-    if [[ -z "$f" ]]; then
-        echo "Uso: termlog show <ficheiro>" >&2
-        return 1
-    fi
-    # Se passaram só o nome relativo, procura nos logs
-    if [[ ! -f "$f" ]]; then
-        local found
-        found="$(find "$TERMLOG_DIR" -name "$f" -type f 2>/dev/null | head -1)"
-        [[ -n "$found" ]] && f="$found"
-    fi
-    if [[ ! -f "$f" ]]; then
-        echo "[termlog] Ficheiro não encontrado: $f" >&2
-        return 1
-    fi
-
-    # Descomprime se necessário, depois passa por sed para remover ANSI
-    local reader="cat"
-    [[ "$f" == *.gz ]] && reader="zcat"
-
-    # Remove sequências ANSI (cores, movimento de cursor) e \r isolados
-    $reader "$f" | sed -E '
-        s/\x1B\[[0-9;?]*[a-zA-Z]//g;
-        s/\x1B\][^\x07]*\x07//g;
-        s/\r$//;
-    '
-}
-
-# -------- Rotação: comprime logs com mais de N dias --------------------------
-cmd_rotate() {
-    local days="${1:-$TERMLOG_ROTATE_DAYS}"
-    if [[ ! -d "$TERMLOG_DIR" ]]; then
-        echo "[termlog] Nada para rodar — $TERMLOG_DIR não existe."
-        return 0
-    fi
-    echo "[termlog] A comprimir logs .log com mais de $days dias em $TERMLOG_DIR..."
-    # Find compatível com Linux e macOS (-mtime +N == modificado há mais de N dias)
-    local count=0
-    while IFS= read -r -d '' file; do
-        gzip -9 "$file" && count=$((count + 1))
-    done < <(find "$TERMLOG_DIR" -type f -name "*.log" -mtime +"$days" -print0 2>/dev/null)
-    echo "[termlog] Comprimidos $count ficheiros."
-}
-
-# -------- Enable/Disable na shell actual -------------------------------------
-cmd_disable() {
-    export TERMLOG_DISABLED=1
-    echo "[termlog] Desactivado para esta shell. Use 'termlog enable' para reactivar."
-}
-cmd_enable() {
-    unset TERMLOG_DISABLED
-    echo "[termlog] Reactivado."
-}
-
-# -------- Help ---------------------------------------------------------------
-cmd_help() {
-    # Imprime as linhas de comentário no topo do ficheiro (skip shebang),
-    # parando quando aparece a primeira linha que não é comentário.
-    awk '
-        NR == 1 && /^#!/ { next }       # skip shebang
-        /^#/ { sub(/^# ?/, ""); print; next }
-        /^$/ && in_header { print; next }
-        { exit }
-        { in_header = 1 }
-    ' "$0"
-}
-
-# -------- Dispatcher ---------------------------------------------------------
-main() {
-    local cmd="${1:-help}"
-    shift || true
-    case "$cmd" in
-        start)   cmd_start   "$@" ;;
-        stop)    cmd_stop    "$@" ;;
-        status)  cmd_status  "$@" ;;
-        list)    cmd_list    "$@" ;;
-        show)    cmd_show    "$@" ;;
-        rotate)  cmd_rotate  "$@" ;;
-        disable) cmd_disable "$@" ;;
-        enable)  cmd_enable  "$@" ;;
-        help|-h|--help) cmd_help ;;
-        *)
-            echo "[termlog] Comando desconhecido: $cmd" >&2
-            cmd_help
-            return 1
-            ;;
+ui_color_enabled() {
+    [[ ! ${NO_COLOR+x} ]] || return 1
+    case $TERMLOG_COLOR in
+        always) return 0 ;;
+        auto) [[ -t 1 && ${TERM:-dumb} != dumb ]] ;;
+        *) return 1 ;;
     esac
 }
-
-main "$@"
+ui_title_start() {
+    if [[ $TERMLOG_TAB_TITLE == rec && -n ${TERMINATOR_UUID:-} && -t 1 && ${TERM:-dumb} != dumb ]]; then
+        printf '\033]0;[REC] TermLog\007'
+    fi
+}
+ui_title_end() {
+    if [[ $TERMLOG_TAB_TITLE == rec && -n ${TERMINATOR_UUID:-} && -t 1 && ${TERM:-dumb} != dumb ]]; then
+        printf '\033]0;Terminal\007'
+    fi
+}
+ui_start() {
+    local label path mode started header
+    label=$(printf '%s' "${TERMLOG_UI_LABEL:-}" | ui_safe); label=${label:-unnamed}
+    path=$(printf '%s' "${TERMLOG_FILE:-}" | ui_safe)
+    started=$(printf '%s' "${TERMLOG_UI_STARTED:-}" | ui_safe)
+    mode=Manual; [[ ${TERMLOG_UI_ORIGIN:-} == auto ]] && mode=Automatic
+    ui_title_start
+    [[ $TERMLOG_BANNER_STYLE == off ]] && return 0
+    ui_width
+    header="[termlog] Logging started.  TermLog v2.1"
+    if ui_color_enabled; then
+        printf '\033[36m'
+        ui_line "$header"
+        printf '\033[0m'
+    else ui_line "$header"; fi
+    if [[ $TERMLOG_BANNER_STYLE == minimal ]]; then
+        ui_line "[termlog] Session #${TERMLOG_UI_ID:-?} / $label ($mode) | $path"
+        ui_line "[termlog] Use exit or Ctrl+D to stop recording."
+    else
+        ui_line "[termlog] Session:    #${TERMLOG_UI_ID:-?} / $label"
+        ui_line "[termlog] Started:    $started"
+        ui_line "[termlog] Mode:       $mode"
+        ui_line "[termlog] Log file:   $path"
+        ui_line "[termlog] Stop:       exit or Ctrl+D"
+    fi
+}
+ui_summary() {
+    local id=$1 label=$2 path=$3 duration=$4 size hours minutes seconds
+    label=$(printf '%s' "$label" | ui_safe); label=${label:-unnamed}
+    path=$(printf '%s' "$path" | ui_safe)
+    size=$(stat -c %s -- "$3" 2>/dev/null) || size='unknown'
+    hours=$((duration / 3600)); minutes=$((duration % 3600 / 60)); seconds=$((duration % 60))
+    ui_width
+    ui_line '[termlog] Session completed'
+    ui_line "[termlog] Session:    #$id / $label"
+    ui_line "$(printf '[termlog] Duration:   %02d:%02d:%02d' "$hours" "$minutes" "$seconds")"
+    ui_line "[termlog] Log size:   $size bytes"
+    ui_line "[termlog] Log file:   $path"
+}
+start_session() {
+    local origin=$1 label=${2:-} today day id=1 stem log timing meta lock safe rc file used
+    START_READY=0
+    [[ -t 0 && -t 1 ]] || { fail 'An interactive terminal is required.'; return 1; }
+    [[ -z ${TERMLOG_ACTIVE:-} ]] || { fail 'Logging is already active in this session.'; return 1; }
+    setup || return 1
+    command -v zsh >/dev/null || { fail 'Zsh not found.'; return 1; }
+    today=$(date +%F) || return 1
+    day=$TERMLOG_DIR/$today
+    private_dir "$day" || return 1
+    global_lock || return 1
+    if [[ $origin == auto ]] && (( $(active_count) == 0 )); then global_unlock; return 2; fi
+    # Match both labelled and unlabelled historical logs and timings.
+    shopt -s nullglob
+    while :; do
+        used=0
+        for file in "$day"/session_"$id".log* "$day"/session_"$id"_*.log* "$day"/session_"$id".timing "$day"/session_"$id"_*.timing; do
+            [[ -e $file || -L $file ]] && { used=1; break; }
+        done
+        (( used == 0 )) && break
+        id=$((id+1))
+    done
+    shopt -u nullglob
+    safe=$(printf '%s' "$label" | LC_ALL=C tr -cs 'A-Za-z0-9_-' '_' | sed -E 's/^_+|_+$//g' | cut -c1-64)
+    stem=session_$id${safe:+_$safe}
+    log=$day/$stem.log; timing=$day/$stem.timing; meta=$day/$stem.meta
+    # noclobber ensures no pre-existing file or symlink is overwritten.
+    if ! ( set -o noclobber; : > "$log" ) 2>/dev/null; then global_unlock; fail 'Could not reserve the log file.'; return 1; fi
+    if ! ( set -o noclobber; : > "$timing" ) 2>/dev/null; then rm -f -- "$log"; global_unlock; fail 'Could not reserve the timing file.'; return 1; fi
+    if ! ( set -o noclobber; : > "$meta" ) 2>/dev/null; then rm -f -- "$log" "$timing"; global_unlock; fail 'Could not reserve the metadata file.'; return 1; fi
+    printf 'started=%s\nid=%s\nlabel=%s\nstate=started\n' "$(date -Is)" "$id" "$safe" > "$meta"
+    lock=$TERMLOG_STATE_DIR/sessions/$today-$id.lock
+    if [[ -L $lock ]] || ! { exec 9>>"$lock" && flock -n -x 9; }; then
+        rm -f -- "$log" "$timing" "$meta"; global_unlock; fail 'Could not reserve the session.'; return 1
+    fi
+    printf '%s\n' "$log" > "${lock%.lock}.meta"
+    global_unlock
+    export TERMLOG_ACTIVE=1 TERMLOG_FILE="$log"
+    export TERMLOG_UI_ID="$id" TERMLOG_UI_LABEL="$safe" TERMLOG_UI_ORIGIN="$origin"
+    export TERMLOG_UI_STARTED="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    TERMLOG_UI_EXEC=$0
+    [[ $TERMLOG_UI_EXEC == */* ]] || TERMLOG_UI_EXEC=$(command -v -- "$TERMLOG_UI_EXEC")
+    TERMLOG_UI_EXEC="$(cd -P -- "$(dirname -- "$TERMLOG_UI_EXEC")" && pwd)/${TERMLOG_UI_EXEC##*/}"
+    export TERMLOG_UI_EXEC
+    local ui_started=$SECONDS
+    export TERMLOG_READY_FILE="${lock%.lock}.ready"
+    # script retains fd 9; its shell explicitly closes it so background jobs cannot retain the lock.
+    script -q -f -a -e --log-timing "$timing" -c ': > "$TERMLOG_READY_FILE"; exec 9>&-; "$TERMLOG_UI_EXEC" _ui-start; exec zsh -i' "$log"
+    rc=$?
+    [[ -f $TERMLOG_READY_FILE ]] && START_READY=1
+    printf 'ended=%s\nexit_code=%s\nstate=ended\n' "$(date -Is)" "$rc" >> "$meta"
+    rm -f -- "$TERMLOG_READY_FILE"
+    unset TERMLOG_READY_FILE
+    exec 9>&-
+    # A stale metadata file is safe: the next query removes it under the global lock.
+    unset TERMLOG_ACTIVE TERMLOG_FILE
+    if (( START_READY )); then
+        ui_title_end
+        ui_summary "$id" "$safe" "$log" "$((SECONDS - ui_started))"
+    fi
+    return "$rc"
+}
+rotate() {
+    local days=${1:-$TERMLOG_ROTATE_DAYS} f base day id lock count=0
+    [[ $days =~ ^[0-9]+$ ]] || { fail 'Days must be a non-negative integer.'; return 1; }
+    setup || return 1
+    global_lock || return 1
+    while IFS= read -r -d '' f; do
+        day=${f%/*}; day=${day##*/}; base=${f##*/}
+        [[ $day =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && $base =~ ^session_([0-9]+)(_[A-Za-z0-9_-]+)?\.log$ ]] || continue
+        id=${BASH_REMATCH[1]}; lock=$TERMLOG_STATE_DIR/sessions/$day-$id.lock
+        [[ ! -L $lock ]] || continue
+        if ( flock -n -x 7 && gzip -n -- "$f" ) 7>>"$lock"; then count=$((count+1)); fi
+    done < <(find "$TERMLOG_DIR" -mindepth 2 -maxdepth 2 -type f -name '*.log' -mtime +"$days" -print0)
+    global_unlock
+    printf '[termlog] Compressed %s files.\n' "$count"
+}
+help_text() { cat <<'HELP'
+Usage: termlog start [name] | stop | status | list [date] | show <file>
+             rotate [days] | enable | disable | config | doctor | help
+HELP
+}
+cmd=${1:-help}; shift || :
+case $cmd in
+    start) start_session manual "${1:-}" ;;
+    _active) check_active ;;
+    _ui-start) ui_start ;;
+    _auto) start_session auto "${1:-}" ;;
+    _entry) START_READY=0; start_session auto "${1:-}"; rc=$?
+        if (( START_READY == 0 )); then
+            printf '[termlog] Automatic startup was cancelled or failed; continuing without logging.\n' >&2
+            unset TERMLOG_ACTIVE TERMLOG_FILE TERMLOG_READY_FILE
+            exec zsh -i
+        fi
+        exit "$rc" ;;
+    status) if [[ -n ${TERMLOG_ACTIVE:-} ]]; then printf '[termlog] Active in this shell: %s\n' "${TERMLOG_FILE:-unknown}"; else printf '[termlog] Inactive in this shell.\n'; fi ;;
+    stop) if [[ -n ${TERMLOG_ACTIVE:-} ]]; then printf '[termlog] Use exit or Ctrl+D to end the recorded shell.\n'; else printf '[termlog] Inactive in this shell.\n'; fi ;;
+    enable|disable) fail 'Load termlog.zsh to change the current shell state.' ;;
+    config) printf 'TERMLOG_MODE=%s\nTERMLOG_DIR=%s\nTERMLOG_STATE_DIR=%s\nTERMLOG_ROTATE_DAYS=%s\nTERMLOG_BANNER_STYLE=%s\nTERMLOG_COLOR=%s\nTERMLOG_TAB_TITLE=%s\n' "$TERMLOG_MODE" "$TERMLOG_DIR" "$TERMLOG_STATE_DIR" "$TERMLOG_ROTATE_DAYS" "$TERMLOG_BANNER_STYLE" "$TERMLOG_COLOR" "$TERMLOG_TAB_TITLE" ;;
+    doctor) setup && { command -v zsh >/dev/null || { fail 'Zsh not found.'; exit 1; }; script --help | grep -q -- --log-timing || { fail 'Incompatible script command.'; exit 1; }; printf '[termlog] Dependencies and directories OK. Terminator: %s; Zsh integration: %s\n' "${TERMINATOR_UUID:-not detected}" "${TERMLOG_ZSH_LOADED:-not detected}"; } ;;
+    list) day=${1:-$(date +%F)}; [[ $day =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { fail 'Invalid date.'; exit 1; }; if [[ -d $TERMLOG_DIR/$day ]]; then find "$TERMLOG_DIR/$day" -maxdepth 1 -type f \( -name 'session_*.log' -o -name 'session_*.log.gz' \) -print | sort; else printf '[termlog] No logs for %s.\n' "$day"; fi ;;
+    show) f=${1:-}; [[ -n $f ]] || { fail 'Specify a file.'; exit 1; }
+        if [[ ! -f $f && $f != */* && -d $TERMLOG_DIR ]]; then
+            mapfile -d '' matches < <(find "$TERMLOG_DIR" -type f -name "$f" -print0)
+            (( ${#matches[@]} == 1 )) || { fail 'File not found or ambiguous name.'; exit 1; }
+            f=${matches[0]}
+        fi
+        [[ -f $f ]] || { fail 'File not found.'; exit 1; }
+        if [[ $f == *.gz ]]; then gzip -cd -- "$f"; else cat -- "$f"; fi | sed -E 's/\x1B\[[0-9;?]*[a-zA-Z]//g; s/\r$//' ;;
+    rotate) rotate "${1:-$TERMLOG_ROTATE_DAYS}" ;;
+    help|-h|--help) help_text ;;
+    *) fail "Unknown command: $cmd"; help_text; exit 1 ;;
+esac
