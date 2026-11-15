@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1300" height="590" viewBox="0 0 1300 590" role="img" aria-labelledby="title desc">
+<title id="title">TermLog v2.1 example: manual activation and optional logging in a new Terminator tab</title>
+<desc id="desc">Two illustrated terminal windows on a dark background. The first shows TermLog starting a manual recon session; the second shows the prompt to record a new tab after the first session is active.</desc>
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#06121d"/><stop offset="1" stop-color="#0d2730"/></linearGradient>
+<linearGradient id="panel" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#132632"/><stop offset="1" stop-color="#091721"/></linearGradient>
+<filter id="shadow"><feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#000" flood-opacity=".35"/></filter>
+</defs>
+<rect width="1300" height="590" rx="24" fill="url(#bg)"/>
+<circle cx="1232" cy="40" r="115" fill="#0e796f" opacity=".08"/><circle cx="80" cy="520" r="180" fill="#0e796f" opacity=".07"/>
+<g font-family="DejaVu Sans,Arial,sans-serif"><text x="54" y="62" fill="#e9f8f7" font-size="28" font-weight="bold">One command. Every session accounted for.</text>
+<text x="54" y="92" fill="#8ba7b3" font-size="17">Illustrative CLI preview · Manual activation + Terminator tab opt-in</text></g>
+
+<rect x="48" y="122" width="590" height="398" rx="16" fill="url(#panel)" stroke="#28505d" stroke-width="1.5" filter="url(#shadow)"/>
+<rect x="49" y="123" width="588" height="51" rx="15" fill="#18303a"/>
+<rect x="49" y="153" width="588" height="20" fill="#18303a"/>
+<circle cx="75" cy="149" r="6" fill="#fa6d77"/><circle cx="97" cy="149" r="6" fill="#f6c95d"/><circle cx="119" cy="149" r="6" fill="#4ed6a4"/>
+<text x="145" y="155" fill="#d9f4f2" font-family="DejaVu Sans,Arial,sans-serif" font-size="14" font-weight="bold">TAB 01  ·  MANUAL START</text>
+<text x="72" y="208" fill="#94b0ba" font-family="DejaVu Sans,Arial,sans-serif" font-size="14">Record the first session</text>
+<rect x="662" y="122" width="590" height="398" rx="16" fill="url(#panel)" stroke="#28505d" stroke-width="1.5" filter="url(#shadow)"/>
+<rect x="663" y="123" width="588" height="51" rx="15" fill="#18303a"/>
+<rect x="663" y="153" width="588" height="20" fill="#18303a"/>
+<circle cx="689" cy="149" r="6" fill="#fa6d77"/><circle cx="711" cy="149" r="6" fill="#f6c95d"/><circle cx="733" cy="149" r="6" fill="#4ed6a4"/>
+<text x="759" y="155" fill="#d9f4f2" font-family="DejaVu Sans,Arial,sans-serif" font-size="14" font-weight="bold">TAB 02  ·  NEW TAB</text>
+<text x="686" y="208" fill="#94b0ba" font-family="DejaVu Sans,Arial,sans-serif" font-size="14">Opt in only while a recording is active</text>
+<text x="72" y="252" fill="#60f1cd" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16" font-weight="bold">$ termlog start recon</text>
+<text x="72" y="299" fill="#d4f7f0" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">[termlog] Logging started.</text>
+<text x="72" y="330" fill="#60f1cd" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16" font-weight="bold">TermLog v2.1    ● REC</text>
+<text x="72" y="371" fill="#d5e8ed" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">Session:  #1 / recon</text>
+<text x="72" y="402" fill="#d5e8ed" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">Mode:     Manual</text>
+<text x="72" y="433" fill="#9bb8c5" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">Log file: ~/logs/.../session_1_recon.log</text>
+<text x="72" y="472" fill="#d5e8ed" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">Stop:     exit or Ctrl+D</text>
+<text x="686" y="252" fill="#d5e8ed" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">[termlog] Active recording detected.</text>
+<text x="686" y="292" fill="#60f1cd" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16" font-weight="bold">Start logging in this tab? [Y/n] y</text>
+<text x="686" y="345" fill="#d5e8ed" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">[termlog] Logging started.</text>
+<text x="686" y="385" fill="#d5e8ed" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">Session:  #2</text>
+<text x="686" y="418" fill="#d5e8ed" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">Mode:     Automatic</text>
+<text x="686" y="465" fill="#9bb8c5" font-family="DejaVu Sans Mono,Liberation Mono,monospace" font-size="16">Independent log + timing file</text>
+<rect x="48" y="541" width="1204" height="1" fill="#294d54"/><text x="54" y="568" fill="#7897a5" font-family="DejaVu Sans,Arial,sans-serif" font-size="14">New tabs are silent until you run termlog start manually. No background daemon.</text></svg>
